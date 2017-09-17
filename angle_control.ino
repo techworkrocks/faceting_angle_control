@@ -23,6 +23,7 @@ LiquidCrystal_I2C lcd(0x3F, 20, 4);
 # define STEPPOS_MIN 0 // minimum of possible step positions
 # define STEPPOS_MAX 16700 // maximum step position
 # define BACKLASH_STEPS 200 // number of steps to go forward and back to eliminate backlash
+# define TOUCH_SENSOR 5 // indication if the faceting arm touches the angle limit
 
 # define MOVE_DOWN 7 // Manual angle adjustment
 # define MOVE_UP 8 // Manual angle adjustment
@@ -38,7 +39,7 @@ LiquidCrystal_I2C lcd(0x3F, 20, 4);
 // angle to step map (non-linear)
 # define NUM_CALIB_VALS 20 // size of arrays below
 int degrees[] = { 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 };
-int steps[] = { 0, 785, 1488, 2314, 3200, 4160, 5082, 6109, 7178, 8148, 9188, 10122, 11101, 12017, 12914, 13795, 14638, 15261, 16000, 16739 };
+int steps[] = { 0, 785, 1488, 2314, 3200, 4160, 5082, 6109, 7178, 8148, 9188, 10122, 11101, 12017, 12914, 13795, 14605, 15375, 16145, 16739 };
 // keep the last result cached, which boosts display refresh time
 int bufLastSteps = -1;
 float bufLastDegrees = 0;
@@ -49,12 +50,16 @@ int currentState; // status variable of the mini state machine
 boolean hasBacklash = false; // is set, if movement stops in (degree wise) upward direction
 int preselectCursor; // index of currently selected memorized position
 int preselectedPos[PRESELECTED_COUNT]; // array holding memorized positions
+
 int targetStepPos; // is set at the beginning of a movement
 boolean stepDir; // true...forward
 boolean dirLast; // remember last direction to avoid setting direction for every step
 
 // button status helpers
 boolean lastState[] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH };
+
+// only redraw numbers, if necessary
+boolean screenDirty = true;
 
 // ring buffer for average calculation of touch sensor
 # define RINGBUF_SIZE 20
@@ -95,8 +100,8 @@ void setup () {
   digitalWrite(CALIBRATE, HIGH); // pull-up
 
   // touch sensor init
-  pinMode ( A1, INPUT);
-  pinMode ( A1, INPUT_PULLUP);
+  pinMode ( TOUCH_SENSOR, INPUT);
+  digitalWrite ( TOUCH_SENSOR, INPUT_PULLUP);
   
 
   // variables
@@ -104,7 +109,9 @@ void setup () {
   stepPos = 0; // assuming 90 degrees
   preselectCursor = 0; // preselection slot index
   targetStepPos = 0;
-  for(int i=0; i<PRESELECTED_COUNT; i++) // all empty at the beginning
+  preselectedPos[0] = 0;
+  preselectedPos[1] = 16145;
+  for(int i=2; i<PRESELECTED_COUNT; i++) // all empty at the beginning
     preselectedPos[i] = -1;
 
   Serial.begin(9600);
@@ -159,33 +166,40 @@ void loop () {
       
       //switch status back
       currentState = STATUS_STOPPED;
+      screenDirty = true;
       setMotorPower(LOW);
     }
   } else if(currentState == STATUS_STOPPED) {
     if(wasPressed(SELECT_NEXT)) {
       preselectCursor++;
-      preselectCursor %= 10; // after 9 comes index 0
+      preselectCursor %= PRESELECTED_COUNT; // after 9 comes index 0
+      screenDirty = true;
     }
     if(wasPressed(GOTO_SELECTED)) {
       if(preselectedPos[preselectCursor] != -1) {
         targetStepPos = preselectedPos[preselectCursor];
         setMotorPower(HIGH);
         currentState = STATUS_RUNNING;
+        screenDirty = true;
       }
     }
     if(wasPressed(SAVE_CURRENT)) {
       preselectedPos[preselectCursor] = stepPos;
+      screenDirty = true;
     }
     if(wasPressed(CLEAR_CURRENT)) {
       preselectedPos[preselectCursor] = -1;
+      screenDirty = true;
     }
     if(wasPressed(CALIBRATE)) {
       stepPos = 0; // current motor position to origin (i.e. 90° for head)
+      screenDirty = true;
     }
     // switch status to running if manual move starts
     if(wasPressed(MOVE_DOWN) || wasPressed(MOVE_UP)) {
       setMotorPower(HIGH);
       currentState = STATUS_RUNNING;
+      screenDirty = true;
     }
 
     updateDisplay();
@@ -195,19 +209,24 @@ void loop () {
 
 void updateDisplay() {
   if(currentState == STATUS_STOPPED) {
-    
-    lcd.setCursor(8,0); lcd.print(stepPos);  lcd.print("/"); lcd.print(mapStepsToDegrees(stepPos));  lcd.print(char(223));
-    lcd.setCursor(4,1); if(preselectCursor<9) lcd.print("0"); lcd.print(preselectCursor+1);  
-    lcd.setCursor(8,1);
-    if(preselectedPos[preselectCursor] > -1) {
-      lcd.print(preselectedPos[preselectCursor]);
-      lcd.print("/");
-      lcd.print(mapStepsToDegrees(preselectedPos[preselectCursor]));
-      lcd.print(char(223));
-    } else {
-      lcd.print("<empty>");
-    }
+    if(screenDirty) {
+      lcd.setCursor(15,0); lcd.print("     ");
+      lcd.setCursor(8,0); lcd.print(stepPos);  lcd.print("/"); lcd.print(mapStepsToDegrees(stepPos));  lcd.print(char(223));
+      lcd.setCursor(4,1); if(preselectCursor<9) lcd.print("0"); lcd.print(preselectCursor+1);  
   
+      if(preselectedPos[preselectCursor] > -1) {
+        lcd.setCursor(15,1); lcd.print("     ");
+        lcd.setCursor(8,1);
+        lcd.print(preselectedPos[preselectCursor]);
+        lcd.print("/");
+        lcd.print(mapStepsToDegrees(preselectedPos[preselectCursor]));
+        lcd.print(char(223));
+      } else {
+        lcd.setCursor(8,1);
+        lcd.print("<empty>     ");
+      }
+      screenDirty = false;
+    }
     // analog read and display
     lcd.setCursor(0,3);
     int touchDegree = getTouchDegree();
@@ -291,9 +310,11 @@ void step (boolean dir, byte dirPin, byte stepperPin, int steps)
  */
 int getTouchDegree() {
   // TODO: actually a digital input would do it as well
-  int r = analogRead(A1);
-
-  touchBuf[bufIndex] = (r < 820);
+  //int r = analogRead(A1);
+  boolean isTouched = !digitalRead(TOUCH_SENSOR);
+  
+  //touchBuf[bufIndex] = (r < 820);
+  touchBuf[bufIndex] = isTouched;
   bufIndex ++;
   bufIndex %= RINGBUF_SIZE;
 
@@ -386,6 +407,5 @@ int findIndexOfRec(int v, int* arr, int low, int high) {
 
   return -1;
 }
-
 
 
